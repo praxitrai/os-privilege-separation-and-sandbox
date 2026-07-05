@@ -61,3 +61,58 @@ static int read_password(char *buf, size_t buflen) {
     if (l && buf[l - 1] == '\n') buf[l - 1] = '\0';
     return 0;
 }
+int main(int argc, char **argv) {
+    if (geteuid() == 0) {
+        fprintf(stderr, "frontend: refusing to run as root -- this process "
+                        "is deliberately unprivileged.\n");
+        return 1;
+    }
+
+    /* --- Shared-memory-backed buffer for the password on this side too,
+     * for the same reason as the backend: an explicit, lockable region we
+     * can wipe as a unit rather than trusting stack reuse. */
+    size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
+    void *pwbuf = mmap(NULL, pagesz, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (pwbuf == MAP_FAILED) { perror("mmap"); return 1; }
+    mlock(pwbuf, pagesz);
+
+    auth_request_t req;
+    memset(&req, 0, sizeof(req));
+    req.magic = AUTH_MAGIC_REQ;
+
+    if (argc > 1) {
+        strncpy(req.username, argv[1], AUTH_USER_MAX - 1);
+    } else {
+        printf("Username: ");
+        fflush(stdout);
+        if (!fgets(req.username, AUTH_USER_MAX, stdin)) return 1;
+        size_t l = strlen(req.username);
+        if (l && req.username[l - 1] == '\n') req.username[l - 1] = '\0';
+    }
+
+    if (read_password((char *)pwbuf, pagesz) != 0) {
+        fprintf(stderr, "frontend: failed to read password\n");
+        munlock(pwbuf, pagesz);
+        munmap(pwbuf, pagesz);
+        return 1;
+    }
+    strncpy(req.password, (char *)pwbuf, AUTH_PASS_MAX - 1);
+    secure_wipe(pwbuf, pagesz); /* done with the shared copy immediately */
+    munlock(pwbuf, pagesz);
+    munmap(pwbuf, pagesz);
+
+    int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sfd < 0) { perror("socket"); secure_wipe(&req, sizeof(req)); return 1; }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, AUTH_SOCK_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(sfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("connect (is backend running?)");
+        secure_wipe(&req, sizeof(req));
+        close(sfd);
+        return 1;
+    }
