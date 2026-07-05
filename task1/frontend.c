@@ -116,3 +116,29 @@ int main(int argc, char **argv) {
         close(sfd);
         return 1;
     }
+/* Note: we do NOT send our uid/gid in the request. The backend reads
+     * it straight from the kernel via SO_PEERCRED on its side, so a
+     * malicious frontend cannot lie about who it is. */
+    ssize_t w = write(sfd, &req, sizeof(req));
+    secure_wipe(&req, sizeof(req)); /* wipe our copy the instant it's sent */
+    if (w != (ssize_t)sizeof(req)) {
+        fprintf(stderr, "frontend: short write to backend\n");
+        close(sfd);
+        return 1;
+    }
+
+    auth_response_t resp;
+    ssize_t r = read(sfd, &resp, sizeof(resp));
+    close(sfd);
+    if (r != (ssize_t)sizeof(resp) || resp.magic != AUTH_MAGIC_RESP) {
+        fprintf(stderr, "frontend: bad/short response from backend\n");
+        return 1;
+    }
+
+    printf("%s\n", resp.granted ? "ACCESS GRANTED" : "ACCESS DENIED");
+    if (resp.error_code != AUTH_ERR_NONE) {
+        fprintf(stderr, "frontend: backend reported code=%d (%s)\n",
+                resp.error_code, resp.message);
+    }
+    return resp.granted ? 0 : 2;
+}
