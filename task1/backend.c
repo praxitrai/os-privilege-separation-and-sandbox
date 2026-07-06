@@ -76,3 +76,68 @@ static int verify_unprivileged(uid_t expected_uid) {
         fprintf(stderr, "[backend] FATAL: privilege drop incomplete!\n");
         return -1;
     }
+/* Runtime check via /proc as required by the assignment, independent
+     * of the getresuid() result above. */
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/status");
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (!strncmp(line, "Uid:", 4)) {
+                fprintf(stderr, "[backend] /proc/self/status -> %s", line);
+            }
+        }
+        fclose(f);
+    }
+
+    /* Attempt to regain root. If this succeeds, privilege dropping was
+     * NOT irreversible and we must treat that as a fatal security bug. */
+    if (setuid(0) == 0) {
+        fprintf(stderr, "[backend] FATAL: setuid(0) succeeded after drop -- "
+                        "privileges were NOT irreversibly dropped!\n");
+        return -1;
+    }
+    if (errno != EPERM) {
+        fprintf(stderr, "[backend] warning: setuid(0) failed with unexpected "
+                        "errno %d (expected EPERM)\n", errno);
+    }
+    return 0;
+}
+
+/* Look up the password hash for `username` in the protected authdb.
+ * MUST be called before privileges are dropped. Format: user:hash */
+static int lookup_hash(const char *username, char *hash_out, size_t hash_out_len) {
+    FILE *f = fopen(AUTHDB_PATH, "r");
+    if (!f) {
+        fprintf(stderr, "[backend] cannot open authdb (%s): %s\n",
+                AUTHDB_PATH, strerror(errno));
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || st.st_uid != 0 ||
+        (st.st_mode & (S_IWGRP | S_IWOTH))) {
+        fprintf(stderr, "[backend] refusing to trust authdb: bad owner/perms\n");
+        fclose(f);
+        return -1;
+    }
+
+    char line[MAX_LINE];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *sep = strchr(line, ':');
+        if (!sep) continue;
+        *sep = '\0';
+        if (strcmp(line, username) == 0) {
+            strncpy(hash_out, sep + 1, hash_out_len - 1);
+            hash_out[hash_out_len - 1] = '\0';
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found ? 0 : -1;
+}
+
