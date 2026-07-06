@@ -141,3 +141,64 @@ static int lookup_hash(const char *username, char *hash_out, size_t hash_out_len
     return found ? 0 : -1;
 }
 
+/* Extremely small fixed-window rate limiter keyed by uid, so a compromised
+ * or buggy frontend cannot brute force the backend into the ground.
+ * This is the "backend rejects requests that are not a valid, well-formed,
+ * rate-permitted validation attempt" attack-resistance requirement. */
+#define RATE_WINDOW_SECONDS 10
+#define RATE_MAX_ATTEMPTS   5
+#define RATE_TABLE_SIZE     64
+
+/* Each connection is handled in its own forked child (process isolation,
+ * per the assignment), so per-uid attempt counters CANNOT simply be
+ * `static` locals -- fork() gives every child a private copy-on-write
+ * address space and any counting done there is invisible to the next
+ * connection's child and to the parent. To make rate limiting actually
+ * work across many short-lived children we keep the table in a
+ * MAP_SHARED|MAP_ANONYMOUS region created ONCE by the parent before the
+ * accept() loop starts; every forked child inherits the same mapping to
+ * the same physical pages, so updates are visible process-to-process
+ * without a separate shared-memory-name/IPC-key dance. */
+typedef struct {
+    uid_t  uid;
+    int    count;
+    time_t window_start;
+} rate_entry_t;
+
+typedef struct {
+    int n;
+    rate_entry_t entries[RATE_TABLE_SIZE];
+} rate_table_t;
+
+static rate_table_t *g_rate_table = NULL;
+
+static rate_table_t *rate_table_create(void) {
+    rate_table_t *t = mmap(NULL, sizeof(rate_table_t), PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (t == MAP_FAILED) return NULL;
+    memset(t, 0, sizeof(*t));
+    return t;
+}
+
+static int rate_limited(uid_t uid) {
+    rate_table_t *t = g_rate_table;
+    time_t now = time(NULL);
+
+    for (int i = 0; i < t->n; i++) {
+        if (t->entries[i].uid == uid) {
+            if (now - t->entries[i].window_start > RATE_WINDOW_SECONDS) {
+                t->entries[i].window_start = now;
+                t->entries[i].count = 0;
+            }
+            t->entries[i].count++;
+            return t->entries[i].count > RATE_MAX_ATTEMPTS;
+        }
+    }
+    if (t->n < RATE_TABLE_SIZE) {
+        t->entries[t->n].uid = uid;
+        t->entries[t->n].count = 1;
+        t->entries[t->n].window_start = now;
+        t->n++;
+    }
+    return 0;
+}
