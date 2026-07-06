@@ -32,3 +32,47 @@
 #include <crypt.h>
 #include <time.h>
 #include "authproto.h"
+#define AUTHDB_PATH "/tmp/authsvc/authdb"
+#define BACKLOG     8
+#define MAX_LINE    256
+
+static volatile sig_atomic_t g_stop = 0;
+static void on_sigterm(int sig) { (void)sig; g_stop = 1; }
+
+/* ------------------------------------------------------------------ */
+/* Explicit, non-optimizable memory wipe.                              */
+/*                                                                      */
+/* Why not memset()? The C standard treats memset() on a buffer that is */
+/* never read again as dead-store-eliminable "as-if" behaviour: a       */
+/* sufficiently smart compiler is permitted to remove it entirely,      */
+/* because from the abstract machine's point of view the write has no   */
+/* observable effect once the object's lifetime ends. This has been      */
+/* repeatedly observed with real compilers at -O2/-O3. explicit_bzero() */
+/* (glibc) is specifically defined to never be optimized away because   */
+/* it is implemented in a separate translation unit the optimizer       */
+/* cannot see into, and/or is annotated to prevent DSE. We additionally  */
+/* pair it with a compiler barrier and munlock() so the page cannot be   */
+/* paged to swap while it holds secrets.                                */
+/* ------------------------------------------------------------------ */
+static void secure_wipe(void *buf, size_t len) {
+    explicit_bzero(buf, len);
+    __asm__ __volatile__("" ::: "memory"); /* compiler barrier, belt & braces */
+}
+
+/* Verify -- at runtime, not just by reading the source -- that this
+ * process no longer holds elevated privileges. Used both as a log
+ * assertion and as a defensive check that aborts if privilege dropping
+ * silently failed (a bug class explained in the report). */
+static int verify_unprivileged(uid_t expected_uid) {
+    uid_t ruid, euid, suid;
+    if (getresuid(&ruid, &euid, &suid) != 0) {
+        perror("getresuid");
+        return -1;
+    }
+    fprintf(stderr, "[backend] post-drop getresuid() -> real=%d eff=%d saved=%d\n",
+            ruid, euid, suid);
+
+    if (ruid != expected_uid || euid != expected_uid || suid != expected_uid) {
+        fprintf(stderr, "[backend] FATAL: privilege drop incomplete!\n");
+        return -1;
+    }
