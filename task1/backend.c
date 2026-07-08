@@ -357,3 +357,4 @@ int main(void) {
     unlink(AUTH_SOCK_PATH);
     return 0;
 }
+
