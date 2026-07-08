@@ -262,3 +262,98 @@ static void handle_client(int cfd, uid_t drop_uid) {
                 strerror(errno));
     }
 
+/* Constant-ish response regardless of *why* it failed (no user
+     * enumeration): unknown user and wrong password look identical. */
+    send_response(cfd, granted, AUTH_ERR_NONE,
+                  granted ? "authentication granted" : "authentication denied");
+
+    fprintf(stderr, "[backend] result for uid=%d user=%s -> %s\n",
+            peer.uid, req.username, granted ? "GRANTED" : "DENIED");
+
+    secure_wipe(shared_pw, pagesz);
+    secure_wipe(hash, sizeof(hash));
+    munlock(shared_pw, pagesz);
+    munmap(shared_pw, pagesz);
+}
+
+int main(void) {
+    if (geteuid() != 0) {
+        fprintf(stderr, "backend: must be started as root (it needs to read "
+                        "%s once, then drops privileges).\n", AUTHDB_PATH);
+        return 1;
+    }
+
+    struct passwd *pw = getpwnam(AUTH_DROP_USER);
+    if (!pw) {
+        fprintf(stderr, "backend: drop-to user '%s' does not exist. "
+                        "Create it with: useradd -r -s /usr/sbin/nologin %s\n",
+                AUTH_DROP_USER, AUTH_DROP_USER);
+        return 1;
+    }
+    uid_t drop_uid = pw->pw_uid;
+
+    signal(SIGCHLD, SIG_IGN); /* reap children automatically, no zombies */
+    signal(SIGTERM, on_sigterm);
+    signal(SIGINT, on_sigterm);
+
+    mkdir("/tmp/authsvc", 0755);
+    unlink(AUTH_SOCK_PATH);
+
+    int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sfd < 0) { perror("socket"); return 1; }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, AUTH_SOCK_PATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("bind"); return 1;
+    }
+    chmod(AUTH_SOCK_PATH, 0666); /* any local user may attempt to connect;
+                                    authorization happens via SO_PEERCRED +
+                                    per-uid credential lookup, not socket
+                                    permission bits */
+    if (listen(sfd, BACKLOG) != 0) { perror("listen"); return 1; }
+
+    g_rate_table = rate_table_create();
+    if (!g_rate_table) {
+        perror("mmap (rate table)");
+        return 1;
+    }
+
+    fprintf(stderr, "[backend] listening on %s as uid=%d (will drop to uid=%d "
+                    "'%s' per connection)\n",
+            AUTH_SOCK_PATH, geteuid(), drop_uid, AUTH_DROP_USER);
+
+    while (!g_stop) {
+        int cfd = accept(sfd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept");
+            break;
+        }
+
+        /* Process isolation per the assignment: each validation happens in
+         * its OWN process (fork), not a thread, so that a memory-safety bug
+         * while handling one hostile request cannot corrupt the address
+         * space of the listening/privileged process or of other in-flight
+         * requests. */
+        pid_t child = fork();
+        if (child == 0) {
+            close(sfd);
+            handle_client(cfd, drop_uid);
+            close(cfd);
+            _exit(0);
+        } else if (child > 0) {
+            close(cfd); /* parent keeps only the listening socket */
+        } else {
+            perror("fork");
+            close(cfd);
+        }
+    }
+
+    close(sfd);
+    unlink(AUTH_SOCK_PATH);
+    return 0;
+}
