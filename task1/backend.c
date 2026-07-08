@@ -202,3 +202,63 @@ static int rate_limited(uid_t uid) {
     }
     return 0;
 }
+tatic void send_response(int fd, int granted, int err, const char *msg) {
+    auth_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.magic = AUTH_MAGIC_RESP;
+    resp.granted = granted;
+    resp.error_code = err;
+    strncpy(resp.message, msg, sizeof(resp.message) - 1);
+    ssize_t w = write(fd, &resp, sizeof(resp));
+    if (w != (ssize_t)sizeof(resp)) {
+        fprintf(stderr, "[backend] short write on response\n");
+    }
+}
+
+/* Handle one already-accepted connection. Called AFTER privileges have
+ * been dropped for the connection-handling child (see main()). */
+static void handle_client(int cfd, uid_t drop_uid) {
+    /* --- Secure IPC: verify who is really on the other end of the socket.
+     * SO_PEERCRED is filled in by the KERNEL at connect() time from the
+     * connecting process's real credentials; it cannot be spoofed by the
+     * client because the client never gets to set these fields itself. */
+    struct ucred peer;
+    socklen_t len = sizeof(peer);
+    if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &peer, &len) != 0) {
+        fprintf(stderr, "[backend] SO_PEERCRED failed: %s\n", strerror(errno));
+        send_response(cfd, 0, AUTH_ERR_BAD_PEER, "internal error");
+        return;
+    }
+    fprintf(stderr, "[backend] peer pid=%d uid=%d gid=%d\n",
+            peer.pid, peer.uid, peer.gid);
+
+    if (rate_limited(peer.uid)) {
+        fprintf(stderr, "[backend] rate limit exceeded for uid=%d, rejecting\n",
+                peer.uid);
+        send_response(cfd, 0, AUTH_ERR_RATE_LIMIT, "too many attempts");
+        return;
+    }
+
+    /* --- Shared memory for the password buffer.
+     * We deliberately place the password in an anonymous MAP_SHARED
+     * region (rather than a plain stack/heap buffer) and mlock() it:
+     *   1. mlock() prevents the page holding the secret from ever being
+     *      written to swap, where it could outlive the process.
+     *   2. Using a distinct mapping makes the secret's lifetime explicit
+     *      and lets us msync/munlock/munmap it as one deliberate unit,
+     *      instead of trusting stack-frame reuse to overwrite it.
+     * (See report Q10-Q12 / README for the objdump verification that the
+     * wipe below survives optimization.) */
+    size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
+    void *shared_pw = mmap(NULL, pagesz, PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared_pw == MAP_FAILED) {
+        perror("mmap");
+        send_response(cfd, 0, AUTH_ERR_INTERNAL, "internal error");
+        return;
+    }
+    if (mlock(shared_pw, pagesz) != 0) {
+        fprintf(stderr, "[backend] warning: mlock failed (%s), continuing\n",
+                strerror(errno));
+    }
+
