@@ -31,3 +31,5 @@ typedef struct {
     char     message[64];  /* short human-readable status, no secrets    */
 } auth_response_t;
 
+
+
