@@ -32,6 +32,7 @@
 #include <crypt.h>
 #include <time.h>
 #include "authproto.h"
+
 #define AUTHDB_PATH "/tmp/authsvc/authdb"
 #define BACKLOG     8
 #define MAX_LINE    256
@@ -76,7 +77,8 @@ static int verify_unprivileged(uid_t expected_uid) {
         fprintf(stderr, "[backend] FATAL: privilege drop incomplete!\n");
         return -1;
     }
-/* Runtime check via /proc as required by the assignment, independent
+
+    /* Runtime check via /proc as required by the assignment, independent
      * of the getresuid() result above. */
     char path[64];
     snprintf(path, sizeof(path), "/proc/self/status");
@@ -202,7 +204,8 @@ static int rate_limited(uid_t uid) {
     }
     return 0;
 }
-tatic void send_response(int fd, int granted, int err, const char *msg) {
+
+static void send_response(int fd, int granted, int err, const char *msg) {
     auth_response_t resp;
     memset(&resp, 0, sizeof(resp));
     resp.magic = AUTH_MAGIC_RESP;
@@ -262,7 +265,59 @@ static void handle_client(int cfd, uid_t drop_uid) {
                 strerror(errno));
     }
 
-/* Constant-ish response regardless of *why* it failed (no user
+    auth_request_t req;
+    ssize_t r = read(cfd, &req, sizeof(req));
+    if (r != (ssize_t)sizeof(req) || req.magic != AUTH_MAGIC_REQ) {
+        fprintf(stderr, "[backend] malformed/short request, rejecting\n");
+        send_response(cfd, 0, AUTH_ERR_BAD_MAGIC, "bad request");
+        munlock(shared_pw, pagesz);
+        munmap(shared_pw, pagesz);
+        return;
+    }
+    req.username[AUTH_USER_MAX - 1] = '\0';
+    req.password[AUTH_PASS_MAX - 1] = '\0';
+
+    /* Copy the password into the guarded shared region; nothing else in
+     * this function keeps a second live copy of it. */
+    memcpy(shared_pw, req.password, AUTH_PASS_MAX);
+    secure_wipe(req.password, sizeof(req.password)); /* wipe the stack copy immediately */
+
+    /* --- The one privileged operation this whole service exists to
+     * protect: reading the protected credential database. This runs
+     * with root's original effective uid because main() has not dropped
+     * yet in the parent — but by design, each connection handler is
+     * forked and drops immediately after this call returns, so the
+     * window in which any code is running as root is as small as
+     * possible and never includes attacker-controlled comparison logic. */
+    char hash[128];
+    int lookup_rc = lookup_hash(req.username, hash, sizeof(hash));
+
+    /* --- Permanently drop privileges now, before touching the password
+     * we just stored, and before doing any comparison work. */
+    if (setresgid(drop_uid, drop_uid, drop_uid) != 0 ||
+        setresuid(drop_uid, drop_uid, drop_uid) != 0) {
+        fprintf(stderr, "[backend] FATAL: setresuid/setresgid failed: %s\n",
+                strerror(errno));
+        secure_wipe(shared_pw, pagesz);
+        munlock(shared_pw, pagesz);
+        munmap(shared_pw, pagesz);
+        _exit(1);
+    }
+    if (verify_unprivileged(drop_uid) != 0) {
+        secure_wipe(shared_pw, pagesz);
+        munlock(shared_pw, pagesz);
+        munmap(shared_pw, pagesz);
+        _exit(1);
+    }
+
+    int granted = 0;
+    if (lookup_rc == 0) {
+        char *result = crypt((char *)shared_pw, hash);
+        if (result && strcmp(result, hash) == 0) {
+            granted = 1;
+        }
+    }
+    /* Constant-ish response regardless of *why* it failed (no user
      * enumeration): unknown user and wrong password look identical. */
     send_response(cfd, granted, AUTH_ERR_NONE,
                   granted ? "authentication granted" : "authentication denied");
@@ -357,4 +412,3 @@ int main(void) {
     unlink(AUTH_SOCK_PATH);
     return 0;
 }
-
