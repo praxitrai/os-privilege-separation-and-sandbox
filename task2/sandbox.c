@@ -75,3 +75,56 @@ static void log_line(sandbox_state_t *s, const char *fmt, ...) {
     fflush(s->logfp);
     va_end(ap);
 }
+/* ---- resource sampling, entirely from OUTSIDE the child ---- */
+static int read_proc_stat_cpu_ticks(pid_t pid, unsigned long long *utime,
+                                     unsigned long long *stime) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    /* Field 14 = utime, 15 = stime (man 5 proc). The comm field (2) can
+     * contain spaces/parentheses, so skip past the LAST ')' first. */
+    char buf[1024];
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return -1; }
+    fclose(f);
+    char *rparen = strrchr(buf, ')');
+    if (!rparen) return -1;
+    unsigned long long u = 0, st = 0;
+    /* fields after ")  " : state(3) ppid(4) pgrp(5) session(6) tty_nr(7)
+     * tpgid(8) flags(9) minflt(10) cminflt(11) majflt(12) cmajflt(13)
+     * utime(14) stime(15) ... */
+    int field = 2;
+    char *p = rparen + 1;
+    while (*p == ' ') p++;
+    char tokbuf[1024];
+    strncpy(tokbuf, p, sizeof(tokbuf) - 1);
+    tokbuf[sizeof(tokbuf)-1] = '\0';
+    char *save = NULL;
+    char *tok = strtok_r(tokbuf, " ", &save);
+    while (tok) {
+        field++;
+        if (field == 14) u = strtoull(tok, NULL, 10);
+        if (field == 15) { st = strtoull(tok, NULL, 10); break; }
+        tok = strtok_r(NULL, " ", &save);
+    }
+    *utime = u; *stime = st;
+    return 0;
+}
+
+static long read_proc_status_rss_kb(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[256];
+    long rss = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "VmRSS:", 6)) {
+            sscanf(line + 6, "%ld", &rss);
+            break;
+        }
+    }
+    fclose(f);
+    return rss;
+}
