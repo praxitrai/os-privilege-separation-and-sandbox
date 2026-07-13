@@ -156,3 +156,58 @@ static void terminate_child(sandbox_state_t *s, const char *reason) {
     }
 }
 
+/* ---- thread 1: wall-clock timer ---- */
+static void *timer_thread(void *arg) {
+    sandbox_state_t *s = (sandbox_state_t *)arg;
+    struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
+
+    while (!atomic_load(&s->stop_monitoring)) {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) +
+                          (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= (double)s->time_limit_sec) {
+            atomic_store(&s->kill_requested, true);
+            terminate_child(s, "wall-clock time limit exceeded");
+            return NULL;
+        }
+        usleep(100 * 1000); /* poll 10x/sec: independent of child cooperation */
+    }
+    return NULL;
+}
+
+/* ---- thread 2: resource sampler (CPU time + RSS) ---- */
+static void *resource_thread(void *arg) {
+    sandbox_state_t *s = (sandbox_state_t *)arg;
+    long clk_tck = sysconf(_SC_CLK_TCK);
+
+    while (!atomic_load(&s->stop_monitoring)) {
+        unsigned long long ut = 0, st = 0;
+        if (read_proc_stat_cpu_ticks(s->child_pid, &ut, &st) == 0) {
+            long cpu_sec = (long)((ut + st) / (clk_tck > 0 ? clk_tck : 100));
+            long rss_kb = read_proc_status_rss_kb(s->child_pid);
+
+            pthread_mutex_lock(&s->lock);
+            s->last_cpu_sec = cpu_sec;
+            if (rss_kb >= 0) s->last_rss_kb = rss_kb;
+            pthread_mutex_unlock(&s->lock);
+
+            if (cpu_sec >= s->cpu_limit_sec) {
+                atomic_store(&s->kill_requested, true);
+                terminate_child(s, "CPU time limit exceeded");
+                return NULL;
+            }
+            if (rss_kb >= 0 && rss_kb >= s->mem_limit_kb) {
+                atomic_store(&s->kill_requested, true);
+                terminate_child(s, "memory (RSS) limit exceeded");
+                return NULL;
+            }
+            log_line(s, "sample: cpu=%lds rss=%ldKB (limits cpu=%lds rss=%ldKB)",
+                      cpu_sec, rss_kb, s->cpu_limit_sec, s->mem_limit_kb);
+        } else {
+            /* /proc/<pid>/stat vanished: child has already exited. */
+            return NULL;
+        }
+        usleep(250 * 1000); /* sample 4x/sec */
+    }
+    return NULL;
+}
