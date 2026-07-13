@@ -128,3 +128,31 @@ static long read_proc_status_rss_kb(pid_t pid) {
     fclose(f);
     return rss;
 }
+static int process_alive(pid_t pid) {
+    /* kill(pid,0) with no signal delivered: pure existence probe, does not
+     * require the child's cooperation and cannot be blocked by it. */
+    return kill(pid, 0) == 0;
+}
+
+/* Kill the child hard, escalating SIGTERM -> SIGKILL if it ignores the
+ * first. The untrusted binary has no say in this whatsoever. */
+static void terminate_child(sandbox_state_t *s, const char *reason) {
+    pthread_mutex_lock(&s->lock);
+    strncpy(s->violation_reason, reason, sizeof(s->violation_reason) - 1);
+    pthread_mutex_unlock(&s->lock);
+
+    log_line(s, "ENFORCEMENT: %s -- sending SIGTERM to pid %d",
+              reason, s->child_pid);
+    kill(s->child_pid, SIGTERM);
+
+    for (int i = 0; i < 20; i++) { /* ~2s grace period, checked from outside */
+        if (!process_alive(s->child_pid)) return;
+        usleep(100 * 1000);
+    }
+    if (process_alive(s->child_pid)) {
+        log_line(s, "ENFORCEMENT: pid %d ignored SIGTERM, sending SIGKILL",
+                  s->child_pid);
+        kill(s->child_pid, SIGKILL);
+    }
+}
+
