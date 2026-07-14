@@ -211,3 +211,87 @@ static void *resource_thread(void *arg) {
     }
     return NULL;
 }
+static void usage(const char *argv0) {
+    fprintf(stderr,
+        "Usage: %s <time_limit_sec> <mem_limit_kb> <cpu_limit_sec> -- <binary> [args...]\n",
+        argv0);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 6) { usage(argv[0]); return 1; }
+    long time_limit = strtol(argv[1], NULL, 10);
+    long mem_limit  = strtol(argv[2], NULL, 10);
+    long cpu_limit  = strtol(argv[3], NULL, 10);
+
+    int sep = 4;
+    if (strcmp(argv[sep], "--") != 0) { usage(argv[0]); return 1; }
+    int bin_idx = sep + 1;
+    if (bin_idx >= argc) { usage(argv[0]); return 1; }
+
+    sandbox_state_t state;
+    memset(&state, 0, sizeof(state));
+    state.time_limit_sec = time_limit;
+    state.mem_limit_kb   = mem_limit;
+    state.cpu_limit_sec  = cpu_limit;
+    pthread_mutex_init(&state.lock, NULL);
+    atomic_store(&state.kill_requested, false);
+    atomic_store(&state.stop_monitoring, false);
+
+    state.logfp = fopen("sandbox.log", "a");
+    if (!state.logfp) state.logfp = stderr;
+
+    log_line(&state, "==== new run: %s, limits time=%lds mem=%ldKB cpu=%lds ====",
+              argv[bin_idx], time_limit, mem_limit, cpu_limit);
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+
+    if (pid == 0) {
+        /* --- Child: exec the untrusted binary. It has no idea a sandbox
+         * exists; it is not handed any file descriptor, signal handler, or
+         * cooperative hook to interact with the controller. Isolation here
+         * additionally rests on execve() replacing the address space
+         * entirely, so nothing from the parent (secrets, open privileged
+         * fds, etc.) is inherited into the untrusted code beyond what a
+         * normal fork+exec would carry -- which we minimize further with
+         * an rlimit safety net below as defense in depth. */
+        struct rlimit rl;
+        rl.rlim_cur = (rlim_t)cpu_limit + 2; /* small grace over the soft
+                                                 external enforcement so the
+                                                 kernel is a backstop, not
+                                                 the primary mechanism */
+        rl.rlim_max = (rlim_t)cpu_limit + 2;
+        setrlimit(RLIMIT_CPU, &rl);
+
+        execve(argv[bin_idx], &argv[bin_idx], NULL);
+        /* only reached if execve failed */
+        perror("execve");
+        _exit(127);
+    }
+
+    /* --- Parent: supervise, never participate in the child's own logic. */
+    state.child_pid = pid;
+    log_line(&state, "spawned child pid=%d", pid);
+
+    pthread_t t_wait, t_timer, t_res;
+    pthread_create(&t_wait, NULL, waiter_thread, &state);
+    pthread_create(&t_timer, NULL, timer_thread, &state);
+    pthread_create(&t_res, NULL, resource_thread, &state);
+
+    pthread_join(t_wait, NULL);
+    atomic_store(&state.stop_monitoring, true);
+    pthread_join(t_timer, NULL);
+    pthread_join(t_res, NULL);
+
+    pthread_mutex_lock(&state.lock);
+    log_line(&state, "==== run complete: exited=%d cpu=%lds rss=%ldKB "
+                      "kill_requested=%d reason='%s' ====",
+              state.child_exited, state.last_cpu_sec, state.last_rss_kb,
+              atomic_load(&state.kill_requested),
+              state.violation_reason[0] ? state.violation_reason : "none");
+    pthread_mutex_unlock(&state.lock);
+
+    pthread_mutex_destroy(&state.lock);
+    if (state.logfp != stderr) fclose(state.logfp);
+    return 0;
+}
